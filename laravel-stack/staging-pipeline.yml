@@ -1,0 +1,340 @@
+## Customise to meet your needs
+
+Description: >
+    Deployment Infrastructure for a Laravel Application
+    This template will deploy a highly available Auto Scaling Group of EC2 instances with the Elasticbeanstalk.
+
+AWSTemplateFormatVersion: 2010-09-09
+Mappings:
+  StageOptionsMap:
+    staging:
+      Branch: develop
+Parameters:
+  GithubOwner:
+    Type: String
+    Default: collins-b
+  GithubRepo:
+    Type: String
+    Description: The repo containing the source code
+  GithubOAuthToken:
+    Type: String
+    Description: "Github access token(https://github.com/settings/tokens)"
+  Stage:
+    Type: String
+    Default: staging
+  EC2KeyPairName:
+    Description: EC2 key pair name for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: AWS::NoValue 
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t1.micro
+    AllowedValues:
+    - t1.micro
+    - m1.small
+    - m1.medium
+    - m1.large
+    - m1.xlarge
+    - m2.xlarge
+    - m2.2xlarge
+    - m2.4xlarge
+    - c1.medium
+    - c1.xlarge
+    - cc1.4xlarge
+    - cc2.8xlarge
+    - cg1.4xlarge
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+Resources:
+  ArtifactS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub "${GithubRepo}-${Stage}-app-bucket"
+
+  WebApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Sub "${GithubRepo}"
+      Description: "Application Description"
+
+  WebApplicationEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref WebApplication
+      EnvironmentName: !Sub "${GithubRepo}-${Stage}"
+      TemplateName: !Ref WebApplicationTemplate
+
+  WebApplicationTemplate:
+    Type: AWS::ElasticBeanstalk::ConfigurationTemplate
+    Properties:
+      ApplicationName: !Ref WebApplication
+      Description: "Laravel Stack Deployment Template"
+      OptionSettings:
+        -
+          Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: LoadBalanced
+        -
+          Namespace: aws:elasticbeanstalk:environment
+          OptionName: LoadBalancerType
+          Value: application
+        -
+          Namespace: aws:autoscaling:asg
+          OptionName: MinSize
+          Value: "1"
+        -
+          Namespace: aws:autoscaling:asg
+          OptionName: MaxSize
+          Value: "2"
+        -
+          Namespace: aws:autoscaling:launchconfiguration 
+          OptionName: IamInstanceProfile
+          Value: "aws-elasticbeanstalk-ec2-role"
+
+        - 
+          Namespace: aws:autoscaling:launchconfiguration
+          OptionName: EC2KeyName
+          Value: !Ref EC2KeyPairName
+        
+      SolutionStackName: "64bit Amazon Linux 2018.03 v2.8.5 running PHP 7.2"
+  
+
+  CodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub "${GithubRepo}-${Stage}"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: "aws/codebuild/nodejs:8.11.0"
+        EnvironmentVariables:
+          -
+            Type: PLAINTEXT
+            Name: "APP_KEY"
+            Value: "base64:syvCE/jiuaDle6HgNB1xoLjLJEiyqcUfqAvCERCqmc0=" # Note: This can be changed.
+          - 
+            Type: PLAINTEXT
+            Name: APP_ENV
+            Value: "staging"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - |
+                    export DEBIAN_FRONTEND=noninteractive
+                    apt-get update
+                    apt-get install -y  software-properties-common
+                    LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+                    apt-get update
+                    apt-get install -y php7.1 \
+                      unzip \
+                      //et cetera
+                    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+                    php composer-setup.php ;
+                    php -r "unlink('composer-setup.php');"
+                    mv composer.phar /usr/local/bin/composer
+            pre_build:
+              commands:
+                - TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION)
+
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Installing composer deps
+                - composer install
+                - et cetera
+
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - ./vendor/bin/phpunit
+
+          artifacts:
+            files:
+              - .ebextensions/**/*
+              - app/**/*
+              - artisan
+              - composer.json
+              - composer.lock
+              - bootstrap/**/*
+              - routes/**/*   
+              - config/**/*
+              - public/**/*
+              - vendor/**/*
+              - et cetera
+            discard-paths: no
+            name: $TAG
+      
+      Artifacts:
+        Type: CODEPIPELINE
+        Name: !Sub "${GithubRepo}-${Stage}"
+  
+  CodePipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    DependsOn: WebApplicationEnvironment
+    Properties:
+      Name: !Sub "${GithubRepo}-${Stage}"
+      RoleArn: !GetAtt CodePipeLineRole.Arn
+      ArtifactStore:
+        Location: !Ref ArtifactS3Bucket
+        Type: S3
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              OutputArtifacts:
+                -
+                  Name: SourceArtifact
+              Configuration:
+                PollForSourceChanges: false
+                Owner: !Ref GithubOwner
+                Repo: !Ref GithubRepo
+                Branch: !FindInMap [StageOptionsMap, !Ref Stage, Branch]
+                OAuthToken: !Ref GithubOAuthToken
+        
+        -
+          Name: Build
+          Actions:
+            -
+              Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                -
+                  Name: SourceArtifact
+              OutputArtifacts:
+                -
+                  Name: !FindInMap [StageOptionsMap, !Ref Stage, Branch]
+              Configuration:
+                ProjectName: !Ref CodeBuild
+
+        -
+          Name: Deploy
+          Actions:
+            -
+              Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ElasticBeanstalk
+              InputArtifacts:
+                -
+                  Name: !FindInMap [StageOptionsMap, !Ref Stage, Branch]
+              Configuration:
+                ApplicationName: !Ref WebApplication
+                EnvironmentName: !Sub "${GithubRepo}-${Stage}"
+
+  CodePipeLineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt ArtifactS3Bucket.Arn
+                  - !Join ['', [!GetAtt ArtifactS3Bucket.Arn, "/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                 - "elasticbeanstalk:*"
+                 - "ec2:*"
+                 - "elasticloadbalancing:*"
+                 - "autoscaling:*"
+                 - "cloudwatch:*"
+                 - "s3:*"
+                 - "sns:*"
+                 - "cloudformation:*"
+                 - "sqs:*"
+                 - "ecs:*"
+                 - "et cetera"
+                Resource:
+                  - "*"
+  
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt ArtifactS3Bucket.Arn
+                  - !Join ['', [!GetAtt ArtifactS3Bucket.Arn, "/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - "*"
+
+Outputs:
+    CodePipelineURL:
+        Description: The URL for the created pipeline
+        Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${GithubRepo}-${Stage}
+    EBWebApplication:
+        Description: The EB application used across all environments
+        Value: !Ref WebApplication
+        Export:
+            Name: !Sub ${GithubRepo}-eb
